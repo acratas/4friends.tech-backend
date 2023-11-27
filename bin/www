@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+/**
+ * Module dependencies.
+ */
+require('dotenv').config();
+const app = require('../app');
+const debug = require('debug')('friends-server:server');
+const http = require('http');
+const net = require('net');
+const jwt = require('jsonwebtoken');
+const pm2 = require('pm2');
+const fs = require('fs');
+const socketIo = require('socket.io');
+
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+const port = normalizePort(process.env.PORT || '3001');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+const server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  const port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  const bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  const addr = server.address();
+  const bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
+
+const serviceConnections = {};
+const clientConnections = {};
+const pm2Processes = {};
+
+/**
+ * WebSocket logic
+ */
+function isScriptRunning(name) {
+  return new Promise((resolve, reject) => {
+    pm2.describe(name, async (error, description) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      console.info('[PM2] Description for', name, 'script:', description);
+      if (description && description.length > 0) {
+        // If there are more than one process, delete all but the first one
+        if (description.length > 1) {
+          for (const process of description.slice(1)) {
+            await new Promise((resolveDel, rejectDel) => {
+              pm2.delete(process.pm_id, (errorDel) => {
+                if (errorDel) {
+                  console.error(`[PM2] Error deleting duplicate process ${process.pm_id}:`, errorDel);
+                  rejectDel(errorDel);
+                } else {
+                  console.warn(`[PM2] Deleted duplicate process ${process.pm_id}`);
+                  resolveDel();
+                }
+              });
+            });
+          }
+        }
+        // Process already exists
+        resolve(true);
+      } else {
+        // Process does not exist
+        resolve(false);
+      }
+    });
+  });
+}
+
+function startPM2Script(address, name) {
+  return new Promise((resolve, reject) => {
+    isScriptRunning(`holder_${name}`).then(isRunning => {
+      if (isRunning) {
+        console.error(`[PM2] Script ${name} is already running`);
+        resolve();
+      } else {
+        pm2.start({
+          name: `holder_${name}`,
+          script: process.env.PM2_SERVICE_SCRIPT,
+          args: [address],
+        }, (error, apps) => {
+          if (error) {
+            console.error(`[PM2] Error starting script ${name}:`, error);
+            reject(error);
+          } else {
+            console.info(`[PM2] Started script ${name}:`, apps);
+            resolve();
+          }
+        });
+      }
+    }).catch(reject);
+  });
+}
+
+
+async function waitForServiceToBecomeActive(address) {
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      if (serviceConnections[address]) {
+        clearInterval(interval);
+        resolve();
+      }
+    }, 200);
+  });
+}
+
+const io = socketIo(server);
+
+io.use((socket, next) => {
+  console.log('Socket connected', socket.handshake.query.token);
+  const token = socket.handshake.query.token;
+  if (!token) {
+    console.error('No token provided');
+    return next(new Error('Authentication error'));
+  }
+  try {
+    const payload = jwt.verify(token, process.env.AUTH_SECRET);
+    socket.clientData = { ...payload };
+    next();
+  } catch (e) {
+    console.error('Invalid token', e);
+    next(new Error('Authentication error'));
+  }
+});
+
+io.on('connection', (socket) => {
+  const address = socket.clientData.address;
+  const name = socket.clientData.name;
+  clientConnections[address] = socket;
+  socket.on('error', console.error);
+  socket.on('disconnect', () => {
+    console.log(`Client ${address} disconnected`)
+    delete clientConnections[address];
+  });
+  socket.on('message', async (message) => {
+    message = typeof message === 'string' ? JSON.parse(message) : message;
+    console.log(`Received message from client ${address}: ${JSON.stringify(message)}`);
+    let serviceSocket = serviceConnections[address];
+    if (!serviceSocket) {
+      if (!pm2Processes[address]) {
+        await startPM2Script(address, name);
+        pm2Processes[address] = true;
+        console.log(`PM2 started for ${address} with name holder_${name}`)
+      }
+      await waitForServiceToBecomeActive(address);
+      console.log(`Service became active for ${address}`);
+      serviceSocket = serviceConnections[address];
+    }
+    if (serviceSocket) {
+      console.log(`Sending message to service ${address}: ${JSON.stringify(message)}`);
+      serviceSocket.write(JSON.stringify(message));
+    }
+  });
+});
+
+
+const expressSocketServer = net.createServer((socket) => {
+  let serviceAddress = null; // Keep track of the service address
+  socket.on('data', (data) => {
+    const message = JSON.parse(data.toString());
+    console.log(`Received message from service ${message.address}: ${JSON.stringify(message)}`);
+    if (!serviceAddress && message.address) {
+      serviceAddress = message.address;
+      serviceConnections[serviceAddress] = socket;
+      console.log(`Service connected: ${serviceAddress}`)
+      socket.on('close', () => {
+        console.log(`Service disconnected: ${serviceAddress}`)
+        delete serviceConnections[serviceAddress]; // Remove the service from the list of active services
+      });
+    }
+    const client = clientConnections[message.address];
+    if (client && message.payload) {
+      console.log(`Sending message to client ${message.address}: ${JSON.stringify(message)}`);
+      client.send(JSON.stringify(message));
+    }
+  });
+});
+
+try {
+  fs.unlinkSync(process.env.EXPRESS_SOCKET_PATH);
+} catch (err) {
+  console.log(err);
+}
+
+expressSocketServer.listen(process.env.EXPRESS_SOCKET_PATH, () => {
+  console.log(`Express UNIX socket server listening at ${process.env.EXPRESS_SOCKET_PATH}`);
+});
